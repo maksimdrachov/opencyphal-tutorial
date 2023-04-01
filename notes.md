@@ -1,0 +1,10 @@
+- How to observe the values stored in `demo_app.db`?
+- from demo: `# We need a node-ID to publish messages properly`
+  - still valid?
+- from demo: `Now let’s see how the simple thermostat node is operating.`
+  - correct? is the node not the whole script itself?
+- from demo: `# r stands for register`
+  - correct?
+- from demo: error in `y r thermostat.pid.gains 2 0 0`
+  - 42 node id is missing
+- how to know which register can be checked? (and their names used in yakut)
