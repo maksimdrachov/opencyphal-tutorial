@@ -5,6 +5,10 @@
   - [Definining data types](#definining-data-types)
   - [Setup a node](#setup-a-node)
   - [Inspecting the node using Yakut](#inspecting-the-node-using-yakut)
+    - [Message interface](#message-interface)
+    - [Register interface](#register-interface)
+    - [Service interface](#service-interface)
+  - [Adding a second node](#adding-a-second-node)
 
 
 The best way to get accustomed with OpenCyphal is to start with pycyphal, which is the (full) protocol implemented in Python. To do this you don't need any additional hardware, everything will be run locally on your computer using loopback to communicate between different nodes.
@@ -350,7 +354,7 @@ This will create 2 additional directories:
 ```bash
 yakut_compile_output
     arasaka_corp/    # new directory 1
-    uavcan/         # new directory 2
+    uavcan/          # new directory 2
 custom_data_types/
     arasaka_corp/
         PerformLinearLeastSquaresFit.1.0.dsdl
@@ -471,6 +475,8 @@ Now, with hopefully some understanding on how the node *looks* like, we can star
 
 (Make sure the node is still running!)
 
+### Message interface
+
 - To listen to the demo's heartbeat and diagnostic, launch the following in a new terminal (leave it running)
 
     ```bash
@@ -507,6 +513,8 @@ Now, with hopefully some understanding on how the node *looks* like, we can star
     - measurement (via Subject ID 2346)
     You should see the published `heater_voltage` Message update accordingly.
 
+### Register interface
+
 - Another important feature of the register interface is that it allows one to monitor internal states of the application, which is critical for debugging.
 
     ```bash
@@ -533,3 +541,218 @@ Now, with hopefully some understanding on how the node *looks* like, we can star
     ```
     
     ![yakut-5](../../images/1-pc-demo/yakut-5.png)
+
+### Service interface
+
+Let's try to call the `least_squares` service:
+
+```bash
+# The following commands do the same thing but differ in verbosity/explicitness:
+y call 42 123:sirius_cyber_corp.PerformLinearLeastSquaresFit 'points: [{x: 10, y: 3}, {x: 20, y: 4}]'
+y q 42 least_squares '[[10, 3], [20, 4]]'
+```
+
+![yakut-6](../../images/1-pc-demo/yakut-6.png)
+
+## Adding a second node
+
+Now we are going to add a second node and make it interoperate with the first one. As the first node implements a basic thermostat, the second one simulates the plant whose temperature is controlled by the thermostat. Put the following into `plant.py` in the same directory:
+
+<details>
+<summary>plant.py</summary>
+
+```py
+#!/usr/bin/env python3
+"""
+This application simulates the plant controlled by the thermostat node: it takes a voltage command,
+runs a crude thermodynamics simulation, and publishes the temperature (i.e., one subscription, one publication).
+"""
+
+import time
+import asyncio
+import pycyphal
+
+# Import DSDL's after pycyphal import hook is installed
+import uavcan.si.unit.voltage
+import uavcan.si.sample.temperature
+import uavcan.time
+from pycyphal.application.heartbeat_publisher import Health
+from pycyphal.application import make_node, NodeInfo, register
+
+
+UPDATE_PERIOD = 0.5
+
+heater_voltage = 0.0
+saturation = False
+
+
+def handle_command(msg: uavcan.si.unit.voltage.Scalar_1, _metadata: pycyphal.transport.TransferFrom) -> None:
+    global heater_voltage, saturation
+    if msg.volt < 0.0:
+        heater_voltage = 0.0
+        saturation = True
+    elif msg.volt > 50.0:
+        heater_voltage = 50.0
+        saturation = True
+    else:
+        heater_voltage = msg.volt
+        saturation = False
+
+
+async def main() -> None:
+    with make_node(NodeInfo(name="org.opencyphal.pycyphal.demo.plant"), "plant.db") as node:
+        # Expose internal states for diagnostics.
+        node.registry["status.saturation"] = lambda: saturation  # The register type will be deduced as "bit[1]".
+
+        # Initialize values from the registry. The temperature is in kelvin because in UAVCAN everything follows SI.
+        # Here, we specify the type explicitly as "real32[1]". If we pass a native float, it would be "real64[1]".
+        temp_environment = float(node.registry.setdefault("model.environment.temperature", register.Real32([292.15])))
+        temp_plant = temp_environment
+
+        # Set up the ports.
+        pub_meas = node.make_publisher(uavcan.si.sample.temperature.Scalar_1, "temperature")
+        pub_meas.priority = pycyphal.transport.Priority.HIGH
+        sub_volt = node.make_subscriber(uavcan.si.unit.voltage.Scalar_1, "voltage")
+        sub_volt.receive_in_background(handle_command)
+
+        # Run the main loop forever.
+        next_update_at = asyncio.get_running_loop().time()
+        while True:
+            # Publish new measurement and update node health.
+            await pub_meas.publish(
+                uavcan.si.sample.temperature.Scalar_1(
+                    timestamp=uavcan.time.SynchronizedTimestamp_1(microsecond=int(time.time() * 1e6)),
+                    kelvin=temp_plant,
+                )
+            )
+            node.heartbeat_publisher.health = Health.ADVISORY if saturation else Health.NOMINAL
+
+            # Sleep until the next iteration.
+            next_update_at += UPDATE_PERIOD
+            await asyncio.sleep(next_update_at - asyncio.get_running_loop().time())
+
+            # Update the simulation.
+            temp_plant += heater_voltage * 0.1 * UPDATE_PERIOD  # Energy input from the heater.
+            temp_plant -= (temp_plant - temp_environment) * 0.05 * UPDATE_PERIOD  # Dissipation.
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
+
+```
+</details>
+
+```mermaid
+---
+title: plant.py
+---
+flowchart TB
+    subgraph 43:org.opencyphal.pycyphal.demo.plant
+        direction TB
+        subgraph heartbeat_publisher
+            direction TB
+            heartbeat_publisher_1[/uavcan.node.Heartbeat.1.0\]
+        end
+        heartbeat_publisher --> uavcan.node.heartbeat
+        subgraph temperature
+            direction TB
+            temperature_publisher_1[/uavcan.si.sample.temperature.Scalar_1\]
+        end
+        temperature --> 2346:uavcan.si.sample.temperature.Scalar
+        subgraph voltage
+            direction TB
+            voltage_1[\uavcan.si.unit.voltage.Scalar_1/]
+            
+        end
+        2347:uavcan.si.unit.voltage.Scalar --> voltage
+    end
+```
+
+Now we could start messing again with setting all the right environment variables/registers, however you might see that this starts to become increasingly impractical as the complexity of the networks starts to grow. Luckily we have the Yakut Orchestrator to help us with this setup part of the process.
+
+The following orchestration file (orc-file) `launch.orc.yaml` does this:
+
+- Compiles two DSDL namespaces: the standard `uavcan` and the custom `arasaka_corp`. If they are already compiled, this step is skipped.
+- When compilation is done, the two applications are launched. Be sure to stop the first script if it is still running! 
+- Aside from the applications, a couple of diagnostic processes are started as well. A setpoint subscriber will command the thermostat to drive the plant to the specified temperature.
+
+<details>
+<summary>launch.orc.yaml</summary>
+
+```yaml
+#!/usr/bin/env -S yakut --verbose orchestrate
+# Read the docs about the orc-file syntax: yakut orchestrate --help
+
+# Shared environment variables for all nodes/processes (can be overridden or selectively removed in local scopes).
+CYPHAL_PATH: "./public_regulated_data_types;./custom_data_types"
+PYCYPHAL_PATH: ".pycyphal_generated"  # This one is optional; the default is "~/.pycyphal".
+
+# Shared registers for all nodes/processes (can be overridden or selectively removed in local scopes).
+# See the docs for pycyphal.application.make_node() to see which registers can be used here.
+uavcan:
+  # Use Cyphal/UDP via localhost:
+  udp.iface: 127.0.0.1
+  # If you have Ncat or some other TCP broker, you can use Cyphal/serial tunneled over TCP (in a heterogeneous
+  # redundant configuration with UDP or standalone). Ncat launch example: ncat --broker --listen --source-port 50905
+  serial.iface: "" # socket://127.0.0.1:50905
+  # It is recommended to explicitly assign unused transports to ensure that previously stored transport
+  # configurations are not accidentally reused:
+  can.iface: ""
+  # Configure diagnostic publishing, too:
+  diagnostic:
+    severity: 2
+    timestamp: true
+
+# Keys with "=" define imperatives rather than registers or environment variables.
+$=:
+- $=:
+  # Wait a bit to let the diagnostic subscriber get ready (it is launched below).
+  - sleep 2
+  - # An empty statement is a join statement -- wait for the previously launched processes to exit before continuing.
+
+  # Launch the demo app that implements the thermostat.
+  - $=: python3 demo_app.py
+    uavcan:
+      node.id: 42
+      sub.temperature_setpoint.id:    2345
+      sub.temperature_measurement.id: 2346
+      pub.heater_voltage.id:          2347
+      srv.least_squares.id:           0xFFFF    # We don't need this service. Disable by setting an invalid port-ID.
+    thermostat:
+      pid.gains: [0.1, 0, 0]
+
+  # Launch the controlled plant simulator.
+  - $=: python3 plant.py
+    uavcan:
+      node.id: 43
+      sub.voltage.id:     2347
+      pub.temperature.id: 2346
+    model.environment.temperature: 300.0    # In UAVCAN everything follows SI, so this temperature is in kelvin.
+
+  # Publish the setpoint a few times to show how the thermostat drives the plant to the correct temperature.
+  # You can publish a different setpoint by running this command in a separate terminal to see how the system responds:
+  #   yakut pub 2345 "kelvin: 200"
+  - $=: |
+      yakut pub 2345:uavcan.si.unit.temperature.scalar 450 -N3
+    uavcan.node.id: 100
+
+# Launch diagnostic subscribers to print messages in the terminal that runs the orchestrator.
+- yakut sub --with-metadata uavcan.diagnostic.record 2346:uavcan.si.sample.temperature.scalar
+
+# Exit automatically if STOP_AFTER is defined (frankly, this is just a testing aid, feel free to ignore).
+- ?=: test -n "$STOP_AFTER"
+  $=: sleep $STOP_AFTER && exit 111
+```
+</details>
+
+To launch the setup: `yakut orc launch.orc.yaml`
+
+![yakut-7](../../images/1-pc-demo/yakut-7.png)
+
+Run `yakut monitor` to see what's happening on the network:
+
+![yakut-8](../../images/1-pc-demo/yakut-8.png)
+
